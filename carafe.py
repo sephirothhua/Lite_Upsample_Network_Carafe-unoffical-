@@ -15,7 +15,7 @@ class KernelPredeictionModule(nn.Module):
         self.enlarge_rate = enlarge_rate
         self.channel_compressor = nn.Sequential(
             OrderedDict([
-                ("compressor_conv" , nn.Conv2d(self.input_channel, self.channel_cm,1)),
+                ("compressor_conv" , nn.Conv2d(self.input_channel, self.channel_cm,1,1,0,bias=False)),
                 ("compressor_bn"   , nn.BatchNorm2d(self.channel_cm)),
                 ("compressor_relu" , nn.ReLU(inplace=True))
             ])
@@ -24,7 +24,7 @@ class KernelPredeictionModule(nn.Module):
             OrderedDict([
                 ("encoder_conv"    , nn.Conv2d(self.channel_cm,
                                           self.enlarge_rate*self.enlarge_rate*self.kernel_up*self.kernel_up,# rate^2*kup^2
-                                          self.kernel_encoder,padding=int((self.kernel_encoder-1)/2))),
+                                          self.kernel_encoder,padding=int((self.kernel_encoder-1)/2),bias=False)),
                 ("encoder_bn"      , nn.BatchNorm2d(self.enlarge_rate*self.enlarge_rate*self.kernel_up*self.kernel_up)),
                 ("encoder_relu"    , nn.ReLU(inplace=True))
             ])
@@ -32,10 +32,12 @@ class KernelPredeictionModule(nn.Module):
         self.kernel_normalizer = nn.Softmax(dim=-1)
     def forward(self, x):
         b,c,w,h = x.shape
+        start_time = datetime.datetime.now()
         x = self.channel_compressor(x)
         x = self.context_encoder(x)
         x = x.view(b,self.kernel_up*self.kernel_up,self.enlarge_rate*w,self.enlarge_rate*h)# batch*(kup^2)*(rate*w)*(rate*h)
         x = self.kernel_normalizer(x)
+        print("KP cost:{}".format(datetime.datetime.now() - start_time))
         return x
 
 class Carafe(nn.Module):
@@ -83,17 +85,16 @@ class Carafe(nn.Module):
         batch, channel, w ,h = x.shape
         # stride to sample
         r = int(self.kernel_up / 2)
-        # pad the x to stride
-        pad = F.pad(x, (r, r, r, r))
-        x_mat = torch.zeros((batch, channel, self.kernel_up**2 , w, h)).cuda()
-        for i in range(w):
-            for j in range(h):
-                pad_x = i + r
-                pad_y = j + r
-                x_mat[:, :, :, i, j] = pad[:, :, pad_x - r:pad_x + r + 1, pad_y - r:pad_y + r + 1]\
-                    .reshape(batch, channel, -1)
-        x_mat = x_mat.repeat(1, 1, 1, self.enlarge_rate, self.enlarge_rate)
-        # each part of the stride part the same!
+        # get the dim kup**2 with unfold with the stride windows
+        x_mat = torch.nn.functional.unfold(x, kernel_size=self.kernel_up, padding=r, stride=1)
+        # make the result to (b,c,kup**2,w,h)
+        x_mat = x_mat.view((batch, channel, self.kernel_up**2, w, h))
+        # nearest inter the number for i map the region [i:i/enlarge,j:j/enlarge]
+        start_time = datetime.datetime.now()
+        x_mat = torch.nn.functional.interpolate(x_mat,
+                                                scale_factor=(1, self.enlarge_rate, self.enlarge_rate),
+                                                mode='nearest')
+        print("inter cost:{}".format(datetime.datetime.now() - start_time))
         return x_mat
 
     def repeat_kernel(self,weight,channel):
@@ -115,11 +116,17 @@ class Carafe(nn.Module):
 
 if __name__ == '__main__':
     import os
-    os.environ["CUDA_VISIBLE_DEVICES"] = '2'
-    model = Carafe(input_channel=128,channel_cm=64).cuda()
-    x = torch.rand((2,128,24,24)).cuda()
+    os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+    model = Carafe(input_channel=320,channel_cm=64).cuda()
+    x = torch.rand((16,320,32,24)).cuda()
+    from model_summary import summary
+    summary(model,x)
 
+    model = model.cuda()
+    x = x.cuda()
+    model(x)
     start_time = datetime.datetime.now()
     out = model(x)
     print("time cost:{}".format(datetime.datetime.now()-start_time))
     print(out.shape)
+
